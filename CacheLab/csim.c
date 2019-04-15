@@ -1,361 +1,297 @@
-/* include necessary headers */
+/* 
+ * csim.c - A cache simulator that can replay traces from Valgrind
+ *     and output statistics such as number of hits, misses, and
+ *     evictions.  The replacement policy is LRU.
+ *
+ * Implementation and assumptions:
+ *  1. Each load/store can cause at most one cache miss. (I examined the trace,
+ *  the largest request I saw was for 8 bytes).
+ *  2. Instruction loads (I) are ignored, since we are interested in evaluating
+ *  trans.c in terms of its data cache performance.
+ *  3. data modify (M) is treated as a load followed by a store to the same
+ *  address. Hence, an M operation can result in two cache hits, or a miss and a
+ *  hit plus an possible eviction.
+ *
+ * The function printSummary() is given to print output.
+ * Please use this function to print the number of hits, misses and evictions.
+ * This is crucial for the driver to evaluate your work. 
+ */
+#include <getopt.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
+#include <string.h>
+#include <errno.h>
 #include "cachelab.h"
+#include "cachelab.c"
 
-#include "getopt.h"
-#include "stdlib.h"
-#include "unistd.h"
+//#define DEBUG_ON 
+#define ADDRESS_LENGTH 64
 
-#include "string.h"
+/* Type: Memory address */
+typedef unsigned long long int mem_addr_t;
 
-#include "stdio.h"
+/* Type: Cache line
+   LRU is a counter used to implement LRU replacement policy  */
+typedef struct cache_line {
+    int valid;
+    mem_addr_t tag;
+    unsigned long long int lru;
+} cache_line_t;
 
-#include "stdint.h"
+typedef cache_line_t* cache_set_t;// set is a set of cache line
+typedef cache_set_t* cache_t;//a cache is a set of set
 
-/* cache struct definition */
-typedef struct CSim_Cache_Entry {
-    char valid_bit;
-    uint64_t tag_bit;
-}CSim_Cache_Entry;
+/* Globals set by command line args */
+int verbosity = 0; /* print trace if set */
+int s = 0; /* set index bits */
+int b = 0; /* block offset bits */
+int E = 0; /* associativity */
+char* trace_file = NULL;
 
-typedef struct CSim_Cache_Set{
-    CSim_Cache_Entry * entries;
-}CSim_Cache_Set;
+/* Derived from command line args */
+int S; /* number of sets */
+int B; /* block size (bytes) */
 
-typedef struct CSim_Cache {
-    /* basic arguments */
-    int block_offset;
-    int set_number;
-    int line_number;
-    /* masks and offsets */
-    int tag_offset;
-    int set_offset;
-    uint64_t tag_mask;
-    uint64_t set_mask;
-    /* cache */
-    CSim_Cache_Set * sets;
-}CSim_Cache;
+/* Counters used to record cache statistics */
+int miss_count = 0;
+int hit_count = 0;
+int eviction_count = 0;
+unsigned long long int lru_counter = 1;
 
-/* simulation result definition */
-typedef struct CSim_Cache_Result {
-    int hit;
-    int miss;
-    int evict;
-}CSim_Cache_Result;
+/* The cache we are simulating */
+cache_t cache;  
+mem_addr_t set_index_mask;
 
-/* operation type definition */
-typedef enum CSIM_OPERATION_TYPE {
-    CSIM_OPERATION_TYPE_NONE,
-    CSIM_OPERATION_TYPE_MODIFY,
-    CSIM_OPERATION_TYPE_LOAD,
-    CSIM_OPERATION_TYPE_STORE,
-}CSIM_OPERATION_TYPE;
+/* 
+ * initCache - Allocate memory, write 0's for valid and tag and LRU
+ * also computes the set_index_mask
+ */
+void initCache()
+{
+    int i,j;
+    cache = (cache_set_t*) malloc(sizeof(cache_set_t) * S);
+    for (i=0; i<S; i++){
+        cache[i]=(cache_line_t*) malloc(sizeof(cache_line_t) * E);
+        for (j=0; j<E; j++){
+            cache[i][j].valid = 0;
+            cache[i][j].tag = 0;
+            cache[i][j].lru = 0;
+        }
+    }
 
-/* operation result definition */
-typedef enum CSIM_OPERATION_RESULT {
-    CSIM_OPERATION_RESULT_MISS,
-    CSIM_OPERATION_RESULT_HIT,
-    CSIM_OPERATION_RESULT_MISS_EVICTION,
-}CSIM_OPERATION_RESULT;
+    /* Computes set index mask */
+    set_index_mask = (mem_addr_t) (pow(2, s) - 1);
+}
 
-/* error definition */
-typedef enum CSIM_ERROR {
-    CSIM_OK = 0,
-    CSIM_ERROR_INVALID_OPTION,
-    CSIM_ERROR_MISSING_ARGUMENT,
-    CSIM_ERROR_FILE_CANNOT_OPEN,
-    CSIM_ERROR_OUT_OF_MEMORY,
-}CSIM_ERROR;
 
-/* macro definition for get a value given mask and offset */
-#define csim_get_value(number, mask, offset) (((number) & (mask)) >> (offset))
+/* 
+ * freeCache - free allocated memory
+ */
+void freeCache()
+{
+    int i;
+    for (int i = 0; i < E; ++i)
+    {
+        free(cache[i]);
+    }
+    free(cache);
+}
 
-/* function list */
-/* message print functions */
-void csim_print_help_info();
-void csim_error_missing_argument();
-void csim_error_file_cannot_open();
-void csim_error_out_of_memory();
-/* cache structure related functions */
-CSim_Cache * csim_construct_cache(int set_number, int line_number, int block_offset);
-void csim_deconstruct_cache(CSim_Cache ** pcache);
-/* cache simulation function */
-CSim_Cache_Result csim_parse_trace_file(CSim_Cache * cache, FILE * file_pointer, char verbose_flag);
 
-/* global variable */
-char * program_name = NULL;
+/*
+ * accessData - Access data at memory address addr.
+ *   If it is already in cache, increast hit_count
+ *   If it is not in cache, bring it in cache, increase miss count.
+ *   Also increase eviction_count if a line is evicted.
+ */
+void accessData(mem_addr_t addr) {
+    int i;
+    /* unsigned long long int eviction_lru = ULONG_MAX; */
+    /* unsigned int eviction_line = 0; */
+    mem_addr_t set_index = (addr >> b) & set_index_mask;
+    mem_addr_t tag = addr >> (s + b);
 
-void csim_print_help_info() {
-    printf("Usage: ./csim [-hv] -s <num> -E <num> -b <num> -t <file>\n");
+    cache_set_t cache_set = cache[set_index];
+
+    /* judge if hit */
+    for (i = 0; i < E; ++i) {
+        /* hit */
+        if (cache_set[i].valid && cache_set[i].tag == tag) {
+            if (verbosity) {
+                printf("hit ");
+            }
+            hit_count++;
+
+            /* update entry whose lru is less than the current lru (newer) */
+            for (int j = 0; j < E; j++) {
+                if (cache_set[j].valid && cache_set[j].lru < cache_set[i].lru) {
+                    ++cache_set[j].lru;
+                }
+            }
+            cache_set[i].lru = 0;
+            return;
+        }
+    }
+
+    /* missed */
+    if (verbosity)
+        printf("miss ");
+    ++miss_count;
+
+    /* find the biggest lru or the first invlaid line */
+    int j = 0;
+    unsigned int eviction_line = 0;
+    unsigned long long maxLru = 0;
+    for (j = 0; j < E && cache_set[j].valid; j++) {
+        if (cache_set[j].lru >= maxLru) {
+            maxLru = cache_set[j].lru;
+            eviction_line = j;
+        }
+    }
+
+    if (j != E) {
+        /* found an invalid entry */
+        /* update other entries */
+        for (int k = 0; k < E; ++k)
+            if (cache_set[k].valid)
+                cache_set[k].lru++;
+        /* insert line */
+        cache_set[j].lru = 0;
+        cache_set[j].valid = 1;
+        cache_set[j].tag = tag;
+    } else {
+        /* all entry is valid, replace the oldest one*/
+        if (verbosity) {
+            printf("eviction ");
+        }
+        eviction_count++;
+        for (int k = 0; k < E; ++k)
+            cache_set[k].lru += 1;
+        cache_set[eviction_line].lru = 0;
+        cache_set[eviction_line].tag = tag;
+    }
+    return;
+}
+
+
+/*
+ * replayTrace - replays the given trace file against the cache 
+ */
+void replayTrace(char *trace_fn) {
+    char buf[1000];
+    mem_addr_t addr = 0;
+    unsigned int len = 0;
+    FILE *trace_fp = fopen(trace_fn, "r");
+
+    int testcount = 0;
+
+    while (fscanf(trace_fp, " %c %llx,%d", buf, &addr, &len) > 0) {
+        if (verbosity && buf[0] != 'I')
+            printf("%c %llx,%d ", buf[0], addr, len);
+        switch (buf[0]) {
+            case 'I':
+                break;
+            case 'L':
+            case 'S':
+                accessData(addr);
+                testcount++;
+                break;
+            case 'M':
+                accessData(addr);
+                accessData(addr);
+                testcount++;
+                break;
+            default:
+                break;
+        }
+        if (verbosity && buf[0] != 'I') {
+            putchar('\n');
+        }
+    }
+    fclose(trace_fp);
+}
+/*
+ * printUsage - Print usage info
+ */
+void printUsage(char* argv[])
+{
+    printf("Welcome to kris's cache system.:)\n");
+    printf("Usage: %s [-hv] -s <num> -E <num> -b <num> -t <file>\n", argv[0]);
     printf("Options:\n");
     printf("  -h         Print this help message.\n");
     printf("  -v         Optional verbose flag.\n");
     printf("  -s <num>   Number of set index bits.\n");
     printf("  -E <num>   Number of lines per set.\n");
     printf("  -b <num>   Number of block offset bits.\n");
-    printf("  -t <file>  Trace file.\n\n");
-    printf("Examples:\n");
-    printf("  linux>  ./csim -s 4 -E 1 -b 4 -t traces/yi.trace\n");
-    printf("  linux>  ./csim -v -s 8 -E 2 -b 4 -t traces/yi.trace\n");
+    printf("  -t <file>  Trace file.\n");
+    printf("\nExamples:\n");
+    printf("  linux>  %s -s 4 -E 1 -b 4 -t traces/yi.trace\n", argv[0]);
+    printf("  linux>  %s -v -s 8 -E 2 -b 4 -t traces/yi.trace\n", argv[0]);
+    exit(0);
 }
 
-void csim_error_missing_argument() {
-    printf("%s: Missing required command line argument\n", program_name);
-    csim_print_help_info();
-}
+/*
+ * main - Main routine 
+ */
+int main(int argc, char* argv[])//-参数名 参数
+{
+    char c;
 
-void csim_error_file_cannot_open() {
-    printf("%s: No such file or directory\n", program_name);
-}
-
-void csim_error_out_of_memory() {
-    printf("%s: Out of memory\n", program_name);
-}
-
-CSim_Cache * csim_construct_cache(int set_number, int line_number, int block_offset) {
-    /* memory allocation */
-    CSim_Cache * cache = malloc(sizeof(CSim_Cache));
-    if (cache == NULL) {
-        csim_error_out_of_memory();
-        exit(CSIM_ERROR_OUT_OF_MEMORY);
-    }
-    /* configure basic arguments */
-    cache->set_number = set_number;
-    cache->line_number = line_number;
-    cache->block_offset = block_offset;
-    /* caculate masks and offsets */
-    cache->tag_mask = ((uint64_t)0xFFFFFFFFFFFFFFFF) << (block_offset + set_number);
-    cache->tag_offset = block_offset + set_number;
-    cache->set_mask = ((((((uint64_t)0xFFFFFFFFFFFFFFFF) << (64 - cache->tag_offset)) >> (64 - cache->tag_offset)) >> block_offset) << block_offset);
-    cache->set_offset = block_offset;
-    /* memory allocation for cache */
-    cache->sets = calloc((1 << set_number), sizeof(CSim_Cache_Set));
-    if (cache->sets == NULL) {
-        csim_error_out_of_memory();
-        exit(CSIM_ERROR_OUT_OF_MEMORY);
-    }
-    for (int index = 0 ; index < (1 << set_number) ; ++index) {
-        (cache->sets)[index].entries = calloc(line_number, sizeof(CSim_Cache_Entry));
-        if ((cache->sets)[index].entries == NULL) {
-            csim_error_out_of_memory();
-            exit(CSIM_ERROR_OUT_OF_MEMORY);
+    while( (c=getopt(argc,argv,"s:E:b:t:vh")) != -1){
+        switch(c){
+        case 's'://组索引位数
+            s = atoi(optarg);
+            break;
+        case 'E'://关联度（每组包含的缓存行数）
+            E = atoi(optarg);
+            break;
+        case 'b'://内存块内地址位数
+            b = atoi(optarg);
+            break;
+        case 't'://内存访问轨迹文件名
+            trace_file = optarg;
+            break;
+        case 'v'://显示轨迹信息
+            verbosity = 1;
+            break;
+        case 'h'://显示帮助信息
+            printUsage(argv);
+            exit(0);
+        default:
+            printUsage(argv);
+            exit(1);
         }
     }
-    return cache;
-}
 
-void csim_deconstruct_cache(CSim_Cache ** pcache) {
-    /* release cache according to construct function */
-    CSim_Cache * temp = *pcache;
-    int set_number = temp->set_number;
-    for (int index = 0 ; index < set_number ; ++index) {
-        free((temp->sets)[index].entries);
+    /* Make sure that all required command line args were specified */
+    if (s == 0 || E == 0 || b == 0 || trace_file == NULL) {
+        printf("%s: Missing required command line argument\n", argv[0]);
+        printUsage(argv);
+        exit(1);
     }
-    free(temp->sets);
-    free(temp);
-    *pcache = NULL;
-}
 
-CSim_Cache_Result csim_parse_trace_file(CSim_Cache * cache, FILE * file_pointer, char verbose_flag) {
-    /* file I/O related */
-    char line[80];
-    char * line_pointer = NULL;
-    /* cache type and cache result */
-    CSIM_OPERATION_TYPE type;
-    CSIM_OPERATION_RESULT result;
-    /* address and set index & tag bis from it */
-    int address = 0;
-    int set = 0, tag = 0;
-    /* line number */
-    int line_number = cache->line_number;
-    /* simulation result */
-    CSim_Cache_Result summary = {0, 0, 0};
-    /* parsing process */
-    while (fgets(line, 80, file_pointer), feof(file_pointer) == 0) {
-        line_pointer = line;
-        type = CSIM_OPERATION_TYPE_NONE;
-        /* exclude instrction load */
-        if (*line_pointer++ == ' ') {
-            switch(*line_pointer++) {
-                case 'L':
-                    type = CSIM_OPERATION_TYPE_LOAD;
-                    if (verbose_flag) {
-                        putchar('L');
-                    }
-                    break;
-                case 'S':
-                    type = CSIM_OPERATION_TYPE_STORE;
-                    if (verbose_flag) {
-                        putchar('S');
-                    }
-                    break;
-                case 'M':
-                    type = CSIM_OPERATION_TYPE_MODIFY;
-                    if (verbose_flag) {
-                        putchar('M');
-                    }
-                    break;
-                default:
-                    type = CSIM_OPERATION_TYPE_NONE;
-                    break;
-            }
-            result = CSIM_OPERATION_RESULT_MISS_EVICTION;
-            sscanf(line_pointer, "%x", &address);
-            if (verbose_flag) {
-                while ((*line_pointer) != '\n') {
-                    putchar(*line_pointer++);
-                }
-            }
-            /* separate set and tag according to mask and offset */
-            set = csim_get_value(address, cache->set_mask, cache->set_offset);
-            tag = csim_get_value(address, cache->tag_mask, cache->tag_offset);
-            /* determine the cache result */
-            CSim_Cache_Entry * pentry = (cache->sets)[set].entries;
-            int index;
-            CSim_Cache_Entry temp;
-            for (index = 0; index < line_number ; ++index) {
-                if (!pentry[index].valid_bit) {
-                    result = CSIM_OPERATION_RESULT_MISS;
-                    break;
-                }
-                if (pentry[index].tag_bit == tag) {
-                    result = CSIM_OPERATION_RESULT_HIT;
-                    break;
-                }
-            }
-            /* simulate according to the result of cache behavior */
-            switch(result) {
-                case CSIM_OPERATION_RESULT_MISS:
-                    if (verbose_flag) {
-                        printf(" miss");
-                    }
-                    pentry[index].valid_bit = 1;
-                    pentry[index].tag_bit = tag;
-                    summary.miss++;
-                    break;
-                case CSIM_OPERATION_RESULT_MISS_EVICTION:
-                    if (verbose_flag) {
-                        printf(" miss eviction");
-                    }
-                    pentry[0].tag_bit = tag;
-                    temp = pentry[0];
-                    for (index = 0 ; index < line_number - 1 ; ++index) {
-                        pentry[index] = pentry[index + 1];
-                    }
-                    pentry[index] = temp;
-                    summary.miss++;
-                    summary.evict++;
-                    break;
-                case CSIM_OPERATION_RESULT_HIT:
-                    if (verbose_flag) {
-                        printf(" hit");
-                    }
-                    temp = pentry[index];
-                    for ( ; (index < line_number - 1) && (pentry[index + 1].valid_bit) ; ++index) {
-                        pentry[index] = pentry[index + 1];
-                    }
-                    pentry[index] = temp;
-                    summary.hit++;
-                    break;
-            }
-            if (type == CSIM_OPERATION_TYPE_MODIFY) {
-                if (verbose_flag) {
-                    printf(" hit");
-                }
-                summary.hit++;
-            }
-            if (verbose_flag) {
-                putchar('\n');
-            }
-        }
-    }
-    return summary;
-}
+    /* Compute S, E and B from command line args */
+    S = (unsigned int)pow(2, s);
+    B = (unsigned int)pow(2, b);
+ 
+    /* Initialize cache */
+    initCache();
 
-int main(int argc, char *argv[]) {
-    /* variables for argument parsing */
-    char h = 0, v = 0, s = 0, E = 0, b = 0, t = 0;
-    int opt;
-    /* cache arguments */
-    int set_number = 0, line_number = 0, block_offset = 0;
-    /* cache */
-    CSim_Cache * cache = NULL;
-    /* file path */
-    char file_path[80];
-    /* verbose flag */
-    char verbose_flag = 0;
-    /* summary */
-    CSim_Cache_Result summary = {0, 0, 0};
-    /* pre-operation */
-    program_name = argv[0];
-    /* argument parsing */
-    while ((opt = getopt(argc, argv, "hvs:E:b:t:")) != -1) {
-        switch(opt) {
-            case 'h':
-                h = 1;
-                break;
-            case 'v':
-                v = 1;
-                verbose_flag = 1;
-                break;
-            case 's':
-                set_number = atoi(optarg);
-                if (set_number == 0) {
-                    csim_error_missing_argument();
-                    return CSIM_ERROR_MISSING_ARGUMENT;
-                }
-                s = 1;
-                break;
-            case 'E':
-                line_number = atoi(optarg);
-                if (line_number == 0) {
-                    csim_error_missing_argument();
-                    return CSIM_ERROR_MISSING_ARGUMENT;
-                }
-                E = 1;
-                break;
-            case 'b':
-                block_offset = atoi(optarg);
-                if (block_offset == 0) {
-                    csim_error_missing_argument();
-                    return CSIM_ERROR_MISSING_ARGUMENT;
-                }
-                b = 1;
-                break;
-            case 't':
-                t = 1;
-                strcpy(file_path, optarg);
-                break;
-            default:
-                csim_print_help_info();
-                return CSIM_ERROR_INVALID_OPTION;
-                break;
-        }
-    }
-    if (h == 1) {
-        csim_print_help_info();
-        return CSIM_OK;
-    }
-    if (v == 1) {
-        verbose_flag = 1;
-    }
-    if (!(s == 1 && E == 1 && b == 1 && t == 1)) {
-        csim_error_missing_argument();
-        return CSIM_ERROR_MISSING_ARGUMENT;
-    }
-    /* file processing */
-    FILE * file_pointer = fopen(file_path, "r");
-    if (file_pointer == NULL) {
-        csim_error_file_cannot_open(file_path);
-        return CSIM_ERROR_FILE_CANNOT_OPEN;
-    }
-    /* cache construction */
-    cache = csim_construct_cache(set_number, line_number, block_offset);
-    /* trace file parsing */
-    summary = csim_parse_trace_file(cache, file_pointer, verbose_flag);
-    /* summary */
-    printSummary(summary.hit, summary.miss, summary.evict);
-    /* post operations */
-    csim_deconstruct_cache(&cache);
-    fclose(file_pointer);
-    return CSIM_OK;
+#ifdef DEBUG_ON
+    printf("DEBUG: S:%u E:%u B:%u trace:%s\n", S, E, B, trace_file);
+    printf("DEBUG: set_index_mask: %llu\n", set_index_mask);
+#endif
+ 
+    replayTrace(trace_file);
+
+    /* Free allocated memory */
+    freeCache();
+
+    /* Output the hit and miss statistics for the autograder */
+    printSummary(hit_count, miss_count, eviction_count);
+    return 0;
 }
